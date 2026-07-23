@@ -1,15 +1,18 @@
 // ============================================================
 //  LEWIS III — proxy + scheduler
 //
-//  Solves two things at once:
+//  Solves three things:
 //   1. CORS. Your browser can't talk to AzuraCast directly (shared host
 //      won't set the header). This server CAN — servers have no CORS limit —
-//      and it adds the header for you. Point Lewis III at THIS instead of
-//      AzuraCast and every call works: push, files, voice-track audio.
-//   2. 24/7 scheduling. It also keeps the AzuraCast queue full on its own,
-//      so your log plays around the clock with no browser open.
+//      and it adds the header for you.
+//   2. RANGE / SEEKING.  <-- this is what killed the voice-track delay.
+//      The old build buffered the WHOLE song into memory before sending a byte,
+//      so jumping to a song's tail meant downloading the entire file first.
+//      Now we forward the browser's Range header, return 206 Partial Content,
+//      and STREAM the bytes — so seeking to the last 10s is instant.
+//   3. 24/7 scheduling (optional) so the queue never runs dry.
 //
-//  Environment variables (Railway -> Variables):
+//  Environment variables:
 //    AZ_URL   https://a9.asurahosting.com
 //    AZ_SID   red_cup_and_rnb
 //    AZ_KEY   your AzuraCast API key
@@ -19,6 +22,7 @@
 
 const http = require('http');
 const { URL } = require('url');
+const { Readable } = require('stream');
 
 const AZ_URL = (process.env.AZ_URL || 'https://a9.asurahosting.com').replace(/\/+$/, '');
 const AZ_SID = process.env.AZ_SID || 'red_cup_and_rnb';
@@ -40,14 +44,16 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, Authorization');
+  // Range must be allowed in, and the range headers must be readable by the browser
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, Authorization, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const u = new URL(req.url, 'http://localhost');
 
   if (u.pathname === '/' || u.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Lewis III proxy up.\nForwarding to ' + AZ_URL + '\nScheduler: ' + (RUN_SCHEDULER ? 'ON' : 'off') + '\n');
+    res.end('Lewis III proxy up.\nForwarding to ' + AZ_URL + '\nRange/seek: ON\nScheduler: ' + (RUN_SCHEDULER ? 'ON' : 'off') + '\n');
     return;
   }
 
@@ -60,15 +66,39 @@ const server = http.createServer(async (req, res) => {
         headers: {
           'X-API-Key': AZ_KEY,
           'Accept': req.headers['accept'] || '*/*',
+          // THE FIX: pass the browser's byte range straight through, so AzuraCast
+          // returns just that slice and the player can jump to a song's tail at once.
+          ...(req.headers['range'] ? { 'Range': req.headers['range'] } : {}),
           ...(body ? { 'Content-Type': req.headers['content-type'] || 'application/json' } : {}),
         },
         body,
+        redirect: 'follow',
       });
-      res.writeHead(upstream.status, {
+
+      const out = {
         'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',
         'Access-Control-Allow-Origin': '*',
-      });
-      res.end(Buffer.from(await upstream.arrayBuffer()));
+        'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
+        // tell the browser it may seek
+        'Accept-Ranges': upstream.headers.get('accept-ranges') || 'bytes',
+      };
+      const cr = upstream.headers.get('content-range');
+      if (cr) out['Content-Range'] = cr;
+      const cl = upstream.headers.get('content-length');
+      if (cl) out['Content-Length'] = cl;
+
+      // keep 206 Partial Content intact — collapsing it to 200 breaks seeking
+      res.writeHead(upstream.status, out);
+
+      if (req.method === 'HEAD' || !upstream.body) { res.end(); return; }
+
+      // STREAM it. The old build did Buffer.from(await upstream.arrayBuffer()),
+      // which held the whole song in memory before sending anything — that was the lag.
+      try {
+        Readable.fromWeb(upstream.body).pipe(res);
+      } catch (streamErr) {
+        res.end(Buffer.from(await upstream.arrayBuffer()));
+      }
     } catch (e) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'proxy failed', detail: String(e.message) }));
@@ -80,7 +110,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Lewis III proxy on :' + PORT + ' -> ' + AZ_URL + ' (scheduler ' + (RUN_SCHEDULER ? 'ON' : 'off') + ')');
+  console.log('Lewis III proxy on :' + PORT + ' -> ' + AZ_URL + ' (range/seek ON, scheduler ' + (RUN_SCHEDULER ? 'ON' : 'off') + ')');
 });
 
 // ---------- optional 24/7 scheduler ----------
